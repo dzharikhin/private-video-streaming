@@ -1,0 +1,12 @@
+.git
+.github
+.opencode
+.venv
+task.md
+README.md
+Makefile
+scripts
+test_camd.py
+__pycache__
+*.pyc
+.gitignore
