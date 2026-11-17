@@ -49,6 +49,14 @@ stream_code=$(curl -s -o "$TMP/stream.bin" -w '%{http_code}' --max-time 3 \
 head -c 8192 "$TMP/stream.bin" | od -An -tx1 | tr -d ' \n' | grep -q 'ffd8' \
   || fail "stream contains no JPEG SOI marker"
 
+# realtime pacing guard: an unthrottled (non-live) input floods ~100MB in 10s,
+# a properly paced 5fps 640x480 stream is ~2MB
+curl -s --max-time 10 -u "$AUTH_USER:$AUTH_PASS" "$URL/stream" -o "$TMP/rate.bin" || true
+rate_size=$(wc -c < "$TMP/rate.bin")
+if [ "$rate_size" -lt 100000 ] || [ "$rate_size" -gt 10000000 ]; then
+  fail "stream produced ${rate_size} bytes in 10s (expected 100KB-10MB; input not realtime-paced?)"
+fi
+
 curl -sf --max-time 20 -u "$AUTH_USER:$AUTH_PASS" "$URL/snapshot.jpg" -o "$TMP/snap.jpg" \
   || fail "snapshot request failed"
 [ "$(head -c 2 "$TMP/snap.jpg" | od -An -tx1 | tr -d ' \n')" = "ffd8" ] \

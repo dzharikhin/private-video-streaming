@@ -20,6 +20,29 @@ docker run --rm -p 8080:8080 --device /dev/video0 \
 Then open `http://localhost:8080/` in a browser and enter the credentials in the native prompt
 (or embed them in the URL: `http://me:secret@localhost:8080/`).
 
+## Finding your camera
+
+Webcams usually appear as `/dev/video0`, `/dev/video1`, … (a single camera may create several
+nodes — one per function). To pick the right one:
+
+```bash
+# best: shows device names next to each node (requires v4l-utils on the host)
+v4l2-ctl --list-devices
+
+# no tools needed: stable symlinks include the camera model
+ls -l /dev/v4l/by-id/
+```
+
+Sanity-check that a device produces video, using this image's ffmpeg (no host installs):
+
+```bash
+docker run --rm --device /dev/video0 \
+  --entrypoint ffmpeg ghcr.io/dzharikhin/private-video-streaming \
+  -hide_banner -f v4l2 -i /dev/video0 -t 1 -f null -
+```
+
+If it works, you will see the device's supported formats and a short encode run without errors.
+
 ## Configuration (env only)
 
 | Env | Default | Description |
@@ -35,11 +58,29 @@ Then open `http://localhost:8080/` in a browser and enter the credentials in the
 | `JPEG_QUALITY` | `5` | ffmpeg `-q:v` scale: 2 = best, 31 = worst |
 | `FFMPEG_EXTRA` | — | raw extra args appended to ffmpeg output options (escape hatch) |
 
+Inputs that are not inherently live (files, lavfi test sources like `testsrc`)
+are automatically paced to realtime via ffmpeg's `-re` flag; device and
+network (`rtsp://`, `http://`) inputs are left as-is.
+
+### Browser notes
+
+The built-in viewer page renders the stream itself: it fetches the multipart
+stream, draws each frame to a `<canvas>`, and immediately releases the decoded
+frame — memory stays flat, so viewing can last indefinitely. The connection is
+also rotated every 5 minutes and paused while the tab is hidden. This requires
+a modern browser (fetch streaming + `createImageBitmap`); older ones fall back
+to a plain `<img>`, where the browser manages memory and long streams can grow
+(Firefox is the most affected).
+
+Avoid opening `/stream` directly or embedding it in your own `<img>` for long
+viewing sessions — browsers accumulate multipart frames on such connections.
+For lower bandwidth on slow links, reduce `WIDTH`/`HEIGHT` or `FPS`.
+
 ## Endpoints
 
 | Path | Auth | Description |
 |---|---|---|
-| `/` | yes | viewer page: live stream via `<img>` |
+| `/` | yes | viewer page: canvas-rendered live stream (memory-safe for indefinite viewing) |
 | `$STREAM_PATH` (default `/stream`) | yes | MJPEG stream (`multipart/x-mixed-replace`) |
 | `/snapshot.jpg` | yes | latest frame as JPEG |
 | `/healthz` | no | JSON status: clients, ffmpeg state, restart count |

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shlex
 import signal
 import subprocess
@@ -26,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_BACKOFF = 30.0
 RESERVED_PATHS = {"/", "/healthz", "/snapshot.jpg"}
+_URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 
 
 class ConfigError(Exception):
@@ -48,8 +50,22 @@ class Config:
     jpeg_quality: int = 5
     ffmpeg_extra: list = field(default_factory=list)
 
+    @property
+    def realtime_pacing(self):
+        """True for inputs that are not inherently live (files, lavfi sources).
+
+        Those are generated/read as fast as ffmpeg can encode, so they need
+        ffmpeg's -re flag to be consumed at native rate instead of flooding
+        the stream at encode speed.
+        """
+        if self.input.startswith("/dev/"):
+            return False
+        return _URL_RE.match(self.input) is None
+
     def ffmpeg_args(self):
-        args = ["-hide_banner", "-loglevel", "warning", "-nostdin"]
+        args = ["-hide_banner", "-loglevel", "error", "-nostdin"]
+        if self.realtime_pacing:
+            args.append("-re")
         if self.input_format:
             args += ["-f", self.input_format]
         args += ["-i", self.input, "-an", "-r", str(self.fps)]
@@ -209,6 +225,7 @@ class CaptureManager:
         self.proc = None
         self.starts = 0
         self.shutdown = False
+        self._terminated = False
         self.thread = threading.Thread(target=self._run, name="capture", daemon=True)
         self.thread.start()
 
@@ -260,6 +277,7 @@ class CaptureManager:
 
     def _terminate_locked(self):
         if self.proc is not None:
+            self._terminated = True
             try:
                 self.proc.terminate()
             except ProcessLookupError:
@@ -279,32 +297,45 @@ class CaptureManager:
         while True:
             with self.cond:
                 if self.shutdown or not self.clients:
-                    break
-            error = self._stream_once()
+                    return
+            error, stopped_by_us = self._stream_once()
             with self.cond:
                 if self.shutdown or not self.clients:
-                    break
+                    if stopped_by_us and not self.shutdown:
+                        self.log.info("ffmpeg stopped (idle)")
+                    return
                 seq = self._wake_seq
+            if stopped_by_us:
+                # We stopped ffmpeg because the last client left, but a new one
+                # arrived during teardown: restart immediately, no backoff.
+                self.log.info("ffmpeg stopped; new client arrived, restarting immediately")
+                backoff = self.backoff
+                continue
             if error:
                 self.log.warning(
                     "ffmpeg exited unexpectedly, restarting in %.1fs: %s", backoff, error
                 )
             else:
-                self.log.info("ffmpeg exited, restarting in %.1fs", backoff)
+                self.log.info("ffmpeg exited cleanly, restarting in %.1fs", backoff)
             with self.cond:
                 # Wake early on shutdown, idle, or a new client arriving.
                 if self.cond.wait_for(
                     lambda: self.shutdown or not self.clients or self._wake_seq != seq,
                     timeout=backoff,
                 ):
-                    break
+                    return
             backoff = min(backoff * 2, MAX_BACKOFF)
         with self.cond:
             if not self.clients:
                 self.latest = None
 
     def _stream_once(self):
-        """Run one ffmpeg attempt until it exits; return an error string or None."""
+        """Run one ffmpeg attempt until it exits.
+
+        Returns (error, stopped_by_us): error is a string or None, and
+        stopped_by_us is True when the exit was caused by our own terminate()
+        (idle stop or shutdown), which ffmpeg reports as exit code 255.
+        """
         cmd = self.spawn()
         with tempfile.TemporaryFile() as errfile:
             try:
@@ -315,9 +346,10 @@ class CaptureManager:
                     stdin=subprocess.DEVNULL,
                 )
             except OSError as exc:
-                return "start ffmpeg: %s" % exc
+                return "start ffmpeg: %s" % exc, False
             with self.cond:
                 self.starts += 1
+                self._terminated = False
                 self.proc = proc
             self.log.info("ffmpeg started (pid %d, input %s)", proc.pid, self.cfg.input)
 
@@ -341,13 +373,16 @@ class CaptureManager:
             returncode = proc.wait()
 
             with self.cond:
+                stopped_by_us = self._terminated
                 if self.proc is proc:
                     self.proc = None
+            if stopped_by_us:
+                return None, True
             if error is None and returncode != 0:
                 errfile.seek(0)
                 tail = errfile.read().decode("utf-8", "replace").strip()[-2048:]
                 error = "exit code %d: %s" % (returncode, tail) if tail else "exit code %d" % returncode
-            return error
+            return error, False
 
 
 # ---------------------------------------------------------------- http

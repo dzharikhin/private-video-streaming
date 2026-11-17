@@ -157,12 +157,12 @@ class LoadConfigTest(unittest.TestCase):
 
 
 class FFmpegArgsTest(unittest.TestCase):
-    def test_basic(self):
+    def test_basic_device_input(self):
         cfg = camd.Config(input="/dev/video0", input_format="v4l2", fps=5, jpeg_quality=5)
         self.assertEqual(
             cfg.ffmpeg_args(),
             [
-                "-hide_banner", "-loglevel", "warning", "-nostdin",
+                "-hide_banner", "-loglevel", "error", "-nostdin",
                 "-f", "v4l2", "-i", "/dev/video0",
                 "-an", "-r", "5",
                 "-c:v", "mjpeg", "-q:v", "5",
@@ -171,12 +171,27 @@ class FFmpegArgsTest(unittest.TestCase):
             ],
         )
 
+    def test_realtime_pacing(self):
+        # Live inputs are already realtime: no pacing flag.
+        for live in ("/dev/video0", "rtsp://cam/stream", "http://cam/mjpeg"):
+            cfg = camd.Config(input=live)
+            self.assertFalse(cfg.realtime_pacing, live)
+            self.assertNotIn("-re", cfg.ffmpeg_args())
+        # Synthetic and file inputs would flood at encode speed: pace them.
+        for paced in ("testsrc=size=640x480:rate=5", "/videos/cam.mp4"):
+            cfg = camd.Config(input=paced)
+            self.assertTrue(cfg.realtime_pacing, paced)
+            args = cfg.ffmpeg_args()
+            self.assertIn("-re", args)
+            self.assertLess(args.index("-re"), args.index("-i"))
+
     def test_scale_and_extra(self):
         cfg = camd.Config(
-            input="x", input_format="lavfi", fps=2, jpeg_quality=3,
-            width=1280, height=720, ffmpeg_extra=["-x", "y"],
+            input="testsrc=size=320x240:rate=2", input_format="lavfi", fps=2,
+            jpeg_quality=3, width=1280, height=720, ffmpeg_extra=["-x", "y"],
         )
         args = cfg.ffmpeg_args()
+        self.assertIn("-re", args)
         self.assertIn("-vf", args)
         self.assertEqual(args[args.index("-vf") + 1], "scale=1280:720")
         self.assertEqual(args[-3:], ["-x", "y", "pipe:1"])
@@ -346,7 +361,11 @@ class ServerTest(unittest.TestCase):
     def test_index_with_auth(self):
         with self.request("/", auth=("u", "p")) as resp:
             body = resp.read().decode()
-        self.assertIn('src="/stream"', body)
+        self.assertIn('id="fallback" src="/stream"', body)
+        self.assertIn('id="viewer"', body)
+        self.assertIn("createImageBitmap", body)
+        self.assertIn("bitmap.close", body)
+        self.assertIn("MJPEGParser", body)
 
     def test_unknown_path_404(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:

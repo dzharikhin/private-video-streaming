@@ -13,13 +13,182 @@
     justify-content: center; gap: 1rem;
   }
   h1 { font-size: 1.1rem; font-weight: 500; margin: 0; }
-  img { max-width: 100%; max-height: 80vh; border-radius: 6px; }
+  img, canvas { max-width: 100%; max-height: 80vh; border-radius: 6px; }
   a { color: #7ab0ff; }
+  #status { font-size: 0.8rem; color: #888; margin: 0; min-height: 1em; }
 </style>
 </head>
 <body>
 <h1>Camera</h1>
-<img src="{{STREAM_PATH}}" alt="live camera stream">
+<img id="fallback" src="{{STREAM_PATH}}" alt="live camera stream">
+<canvas id="viewer" hidden></canvas>
+<p id="status">connecting…</p>
 <p><a href="/snapshot.jpg">snapshot</a></p>
+<script>
+"use strict";
+(function (global) {
+  // Incremental multipart/x-mixed-replace parser, testable outside the browser.
+  var BOUNDARY = new Uint8Array([0x2d, 0x2d, 0x66, 0x72, 0x61, 0x6d, 0x65]); // "--frame"
+  var CRLFCRLF = new Uint8Array([0x0d, 0x0a, 0x0d, 0x0a]);
+
+  function findBytes(buf, needle, from) {
+    outer: for (var i = from; i <= buf.length - needle.length; i++) {
+      for (var j = 0; j < needle.length; j++) {
+        if (buf[i + j] !== needle[j]) continue outer;
+      }
+      return i;
+    }
+    return -1;
+  }
+
+  function append(a, b) {
+    var out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+  }
+
+  // Extract the next complete part from buf.
+  // Returns { frame: Uint8Array, consumed: int } or null when incomplete.
+  function extractPart(buf) {
+    var b = findBytes(buf, BOUNDARY, 0);
+    if (b < 0) return null;
+    var h = findBytes(buf, CRLFCRLF, b);
+    if (h < 0) return null;
+    var header = new TextDecoder().decode(buf.subarray(b, h));
+    var m = /content-length:\s*(\d+)/i.exec(header);
+    if (!m) throw new Error("part without content-length");
+    var len = parseInt(m[1], 10);
+    var start = h + 4;
+    if (buf.length < start + len + 2) return null;
+    return { frame: buf.subarray(start, start + len), consumed: start + len + 2 };
+  }
+
+  global.MJPEGParser = { findBytes: findBytes, append: append, extractPart: extractPart };
+
+  if (typeof document === "undefined" || !document.getElementById("viewer")) return;
+
+  var STREAM_PATH = "{{STREAM_PATH}}";
+  // Rotate the connection periodically so no browser can accumulate
+  // per-connection state indefinitely; frames are also released explicitly.
+  var ROTATE_MS = 5 * 60 * 1000;
+
+  var img = document.getElementById("fallback");
+  var canvas = document.getElementById("viewer");
+  var statusEl = document.getElementById("status");
+  var ctx = canvas.getContext("2d");
+  var canvasSwapDone = false;
+  var stopped = false;
+  var controller = null;
+  var abortReason = null;
+  var statusBase = "";
+
+  function capable() {
+    return typeof global.fetch === "function" &&
+      typeof global.ReadableStream === "function" &&
+      typeof global.createImageBitmap === "function";
+  }
+  if (!capable()) return; // keep <img> fallback (browser-managed rendering)
+
+  img.removeAttribute("src"); // canvas viewer replaces it; avoid a second stream
+
+  function setStatus(text) { statusEl.textContent = text; }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function visibleAgain() {
+    return new Promise(function (resolve) {
+      document.addEventListener("visibilitychange", function onVis() {
+        if (!document.hidden) {
+          document.removeEventListener("visibilitychange", onVis);
+          resolve();
+        }
+      });
+    });
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden && controller) {
+      abortReason = "hidden";
+      controller.abort(); // pauses the stream (and server-side capture) while hidden
+    }
+  });
+
+  async function drawFrame(bytes) {
+    var blob = new Blob([bytes], { type: "image/jpeg" });
+    var bitmap = await global.createImageBitmap(blob);
+    if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      if (!canvasSwapDone) {
+        img.hidden = true;
+        canvas.hidden = false;
+        canvasSwapDone = true;
+      }
+      statusBase = "live · " + bitmap.width + "×" + bitmap.height;
+      setStatus(statusBase);
+    }
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close(); // release the decoded frame immediately: bounded memory
+  }
+
+  async function pump(reader) {
+    var pending = new Uint8Array(0);
+    while (true) {
+      var r = await reader.read();
+      if (r.done) return;
+      pending = append(pending, r.value);
+      while (true) {
+        var part = extractPart(pending);
+        if (!part) break;
+        await drawFrame(part.frame);
+        pending = pending.subarray(part.consumed);
+      }
+      var b = findBytes(pending, BOUNDARY, 0);
+      if (b > 0) pending = pending.subarray(b);
+      else if (b < 0) pending = pending.subarray(Math.max(0, pending.length - BOUNDARY.length + 1));
+    }
+  }
+
+  async function run() {
+    while (!stopped) {
+      controller = new AbortController();
+      abortReason = null;
+      var rotateTimer = setTimeout(function () {
+        abortReason = "rotate";
+        controller.abort();
+      }, ROTATE_MS);
+      try {
+        var resp = await global.fetch(STREAM_PATH, {
+          signal: controller.signal,
+          cache: "no-store"
+        });
+        if (resp.status === 401) {
+          setStatus("unauthorized — reload the page");
+          stopped = true;
+          return;
+        }
+        if (!resp.ok || !resp.body) throw new Error("HTTP " + resp.status);
+        await pump(resp.body.getReader());
+        if (!stopped) setStatus("reconnecting");
+      } catch (err) {
+        // rotation aborts are expected; anything else falls through to retry
+      } finally {
+        clearTimeout(rotateTimer);
+      }
+      if (stopped) return;
+      if (document.hidden) {
+        setStatus("paused (tab hidden)");
+        await visibleAgain();
+        if (stopped) return;
+        continue;
+      }
+      await sleep(abortReason === "rotate" ? 150 : 1000);
+    }
+  }
+
+  run();
+})(typeof window !== "undefined" ? window : globalThis);
+</script>
 </body>
 </html>
