@@ -4,12 +4,14 @@ import io
 import json
 import logging
 import os
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 import camd
 
@@ -101,14 +103,28 @@ def write_file(directory, name, data):
 class LoadConfigTest(unittest.TestCase):
     def test_defaults(self):
         with patched_env(**base_env(AUTH_USER="u", AUTH_PASS="p")):
-            cfg = camd.load_config()
-        self.assertEqual(cfg.input, "/dev/video0")
+            with mock.patch("camd.autodetect_video_device", return_value="/dev/video3"):
+                cfg = camd.load_config()
+        self.assertEqual(cfg.input, "/dev/video3")
         self.assertEqual(cfg.input_format, "v4l2")
         self.assertEqual(cfg.port, 8080)
         self.assertEqual(cfg.stream_path, "/stream")
         self.assertEqual(cfg.fps, 5)
         self.assertEqual(cfg.jpeg_quality, 5)
         self.assertEqual(cfg.ffmpeg_extra, [])
+
+    def test_explicit_input_skips_autodetect(self):
+        with patched_env(**base_env(AUTH_USER="u", AUTH_PASS="p", INPUT="/dev/video1")):
+            with mock.patch("camd.autodetect_video_device") as autodetect:
+                cfg = camd.load_config()
+        autodetect.assert_not_called()
+        self.assertEqual(cfg.input, "/dev/video1")
+        self.assertEqual(cfg.input_format, "v4l2")
+
+    def test_autodetect_failure_requires_input(self):
+        with patched_env(**base_env(AUTH_USER="u", AUTH_PASS="p")):
+            with mock.patch("camd.autodetect_video_device", return_value=None):
+                self.assertRaises(camd.ConfigError, camd.load_config)
 
     def test_requires_auth(self):
         with patched_env(**base_env(AUTH_USER="u")):
@@ -154,6 +170,49 @@ class LoadConfigTest(unittest.TestCase):
         self.assertEqual((cfg.width, cfg.height), (320, 240))
         self.assertEqual(cfg.jpeg_quality, 3)
         self.assertEqual(cfg.ffmpeg_extra, ["-bf", "0"])
+
+
+class AutodetectTest(unittest.TestCase):
+    def test_list_sorted_numerically(self):
+        nodes = ["/dev/video10", "/dev/video2", "/dev/video0"]
+        with mock.patch("camd.glob.glob", return_value=nodes):
+            self.assertEqual(
+                camd.list_video_devices(),
+                ["/dev/video0", "/dev/video2", "/dev/video10"],
+            )
+
+    def test_first_working_node_wins(self):
+        with mock.patch(
+            "camd.list_video_devices",
+            return_value=["/dev/video0", "/dev/video1", "/dev/video2"],
+        ), mock.patch("camd.probe_video_device", side_effect=[False, True]):
+            self.assertEqual(camd.autodetect_video_device(), "/dev/video1")
+
+    def test_no_working_node(self):
+        with mock.patch(
+            "camd.list_video_devices", return_value=["/dev/video0", "/dev/video1"]
+        ), mock.patch("camd.probe_video_device", return_value=False):
+            self.assertIsNone(camd.autodetect_video_device())
+
+    def test_probe_grabs_one_frame(self):
+        with mock.patch("camd.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            self.assertTrue(camd.probe_video_device("/dev/video0"))
+        args = run.call_args[0][0]
+        self.assertEqual(args[0], "ffmpeg")
+        self.assertEqual(args[args.index("-f") + 1], "v4l2")
+        self.assertEqual(args[args.index("-i") + 1], "/dev/video0")
+        self.assertIn("-frames:v", args)
+
+    def test_probe_failure_and_timeout(self):
+        with mock.patch("camd.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=1)
+            self.assertFalse(camd.probe_video_device("/dev/video0"))
+        with mock.patch(
+            "camd.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("ffmpeg", 10),
+        ):
+            self.assertFalse(camd.probe_video_device("/dev/video0"))
 
 
 class FFmpegArgsTest(unittest.TestCase):

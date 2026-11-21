@@ -23,7 +23,10 @@ Then open `http://localhost:8080/` in a browser and enter the credentials in the
 ## Finding your camera
 
 Webcams usually appear as `/dev/video0`, `/dev/video1`, … (a single camera may create several
-nodes — one per function). To pick the right one:
+nodes — one per function). If `INPUT` is not set, the container auto-detects at startup: it
+probes every `/dev/video*` node it was given via `--device` and uses the first one that
+actually delivers a frame (metadata nodes are skipped automatically) — so pointing
+`--device` at the camera is usually all you need. To pick a specific node instead:
 
 ```bash
 # best: shows device names next to each node (requires v4l-utils on the host)
@@ -49,7 +52,7 @@ If it works, you will see the device's supported formats and a short encode run 
 |---|---|---|
 | `AUTH_USER` | — | **required**; Basic auth username (server refuses to start without it) |
 | `AUTH_PASS` | — | **required**; Basic auth password |
-| `INPUT` | `/dev/video0` | any ffmpeg input: device path, `rtsp://…`, `testsrc=…`, etc. |
+| `INPUT` | auto | first capture-capable `/dev/video*` node (probed at startup); or any ffmpeg input: device path, `rtsp://…`, `testsrc=…`, etc. |
 | `INPUT_FORMAT` | auto (`v4l2` for `/dev/*`) | ffmpeg input format (`-f`), e.g. `lavfi` for test sources |
 | `PORT` | `8080` | HTTP port to listen on |
 | `STREAM_PATH` | `/stream` | path of the MJPEG stream |

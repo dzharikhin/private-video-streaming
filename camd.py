@@ -7,6 +7,7 @@ script serves HTTP and fans frames out to clients.
 """
 
 import base64
+import glob
 import hashlib
 import hmac
 import json
@@ -26,6 +27,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_BACKOFF = 30.0
+PROBE_TIMEOUT = 10.0
 RESERVED_PATHS = {"/", "/healthz", "/snapshot.jpg"}
 _URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 
@@ -38,7 +40,7 @@ class ConfigError(Exception):
 
 @dataclass
 class Config:
-    input: str = "/dev/video0"
+    input: str = ""
     input_format: str = ""
     port: int = 8080
     stream_path: str = "/stream"
@@ -86,6 +88,48 @@ class Config:
         return "%dx%d" % (self.width, self.height) if self.width else "native"
 
 
+def list_video_devices():
+    """Existing /dev/video* nodes in numeric order (video2 before video10)."""
+
+    def node_number(node):
+        match = re.search(r"(\d+)$", node)
+        return int(match.group(1)) if match else -1
+
+    return sorted(glob.glob("/dev/video*"), key=node_number)
+
+
+def probe_video_device(node):
+    """True if the node actually delivers a v4l2 video frame.
+
+    Asks ffmpeg to grab a single frame — the same check the README recommends
+    as a manual sanity test. Metadata-only nodes fail fast; capture nodes that
+    produce no signal (e.g. an idle HDMI grabber) time out and are skipped.
+    """
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+             "-f", "v4l2", "-i", node, "-frames:v", "1", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=PROBE_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0
+
+
+def autodetect_video_device():
+    """First capture-capable /dev/video* node, or None if none works.
+
+    One camera commonly exposes several nodes (capture + metadata), so each
+    is probed rather than trusting the lowest number.
+    """
+    for node in list_video_devices():
+        if probe_video_device(node):
+            return node
+    return None
+
+
 def load_config(env=None):
     env = os.environ if env is None else env
 
@@ -107,7 +151,7 @@ def load_config(env=None):
         return value
 
     cfg = Config(
-        input=get("INPUT", "/dev/video0"),
+        input=get("INPUT", ""),
         input_format=env.get("INPUT_FORMAT", ""),
         port=env_int("PORT", 8080, 1, 65535),
         stream_path=get("STREAM_PATH", "/stream"),
@@ -118,6 +162,19 @@ def load_config(env=None):
         height=env_int("HEIGHT", 0, 1, 65535),
         jpeg_quality=env_int("JPEG_QUALITY", 5, 2, 31),
     )
+    if not cfg.input:
+        cfg.input = autodetect_video_device()
+        if cfg.input:
+            logging.getLogger("camd").info(
+                "input auto-detected: %s (set INPUT to override)", cfg.input
+            )
+        else:
+            nodes = list_video_devices()
+            detail = ", ".join(nodes) if nodes else "no /dev/video* nodes present"
+            raise ConfigError(
+                "INPUT is not set and no capture-capable device was found (%s); "
+                "set INPUT to a device path, rtsp://..., or testsrc=..." % detail
+            )
     if not cfg.auth_user or not cfg.auth_pass:
         raise ConfigError("AUTH_USER and AUTH_PASS are required")
     if (cfg.width == 0) != (cfg.height == 0):
