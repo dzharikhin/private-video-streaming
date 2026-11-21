@@ -46,6 +46,67 @@ docker run --rm --device /dev/video0 \
 
 If it works, you will see the device's supported formats and a short encode run without errors.
 
+## Device access over SSH (headless)
+
+Webcam nodes are owned by `root:video` with mode `0660`, plus an ACL that
+systemd-logind grants only to the user logged into the desktop ("seat")
+session. That's why over SSH the camera often fails with `Permission denied`
+until someone logs in at the UI — and works again from SSH after they do.
+
+Listing ≠ access: `v4l2-ctl --list-devices` reads names from sysfs without
+opening the devices, so it can list cameras you cannot actually use. Check
+real access with `ls -l /dev/video*` and `id`.
+
+### Host-side tools (ffmpeg, v4l2-ctl)
+
+Add yourself to the `video` group, then open a **new** SSH session — group
+membership only applies to new logins:
+
+```bash
+sudo usermod -aG video $USER   # then log out and back in
+```
+
+### Containers: rootful vs rootless docker
+
+Check which daemon you are talking to:
+
+```bash
+docker context show   # "default" → rootful, "rootless" → rootless
+```
+
+- **Rootful**: the daemon is root, so `--device` works regardless of your
+  user's permissions — nothing extra needed.
+- **Rootless**: container processes run with your uid but no supplementary
+  groups, and the host's `video` gid is not mapped into the container's user
+  namespace — so group membership (and `--group-add`) cannot grant access.
+  Only a per-uid ACL or "other" bits on the device node help.
+
+Temporary access for rootless (until the node is re-created by reboot/replug):
+
+```bash
+sudo setfacl -m u:$USER:rw /dev/video0
+# or all nodes at once:
+for n in /dev/video*; do sudo setfacl -m u:$USER:rw "$n"; done
+```
+
+Permanent access — `/etc/udev/rules.d/99-video-headless.rules` (replace
+`youruser`):
+
+```
+SUBSYSTEM=="video4linux", RUN+="/usr/bin/setfacl -m u:youruser:rw $devnode"
+```
+
+```bash
+sudo udevadm control --reload && sudo udevadm trigger -s video4linux
+```
+
+A blunter alternative is `SUBSYSTEM=="video4linux", MODE="0666"` — camera
+readable by anyone on the machine; fine for single-user boxes.
+
+Rootless `--device` also snapshots the node at container start, so the camera
+must be present before `docker run` (hotplug into a running container is not
+picked up).
+
 ## Configuration (env only)
 
 | Env | Default | Description |
@@ -130,6 +191,9 @@ docker run --rm --user "$(id -u):$(id -g)" --group-add "$(getent group video | c
   -e AUTH_USER=me -e AUTH_PASS=secret \
   ghcr.io/dzharikhin/private-video-streaming
 ```
+
+(`--group-add` with the host's `video` gid works with rootful docker; rootless
+cannot map host gids — see [Device access over SSH (headless)](#device-access-over-ssh-headless).)
 
 Also recommended in production: TLS-terminating reverse proxy in front, since Basic Auth over
 plain HTTP sends base64 (not encrypted) credentials.
